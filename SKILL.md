@@ -20,16 +20,110 @@ description: |
 **没有 workflow JSON = 禁止开始任务。**
 禁止用文字描述节点结构代替 JSON 文件。
 
+## 阶段负一：环境依赖检查（进门后必须先执行）
+
+> 在做任何操作之前，先系统性地验证环境是否满足要求。检查不通过则停止任务，不允许强行推进。
+
+### 环境检查清单（全部通过才算合格）
+
+```bash
+# ═══ 1. GPU 检查 ═══
+nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version --format=csv,noheader
+# 记录显存：<16GB / 24GB / 40GB / 48GB / 80GB -> 决定下载哪个模型版本
+
+# ═══ 2. CUDA / cuDNN 版本 ═══
+python3 -c "import torch; print('CUDA:', torch.version.cuda, '| cuDNN:', torch.backends.cudnn.version(), '| torch:', torch.__version__)"
+# 要求：CUDA ≥ 11.8, torch ≥ 2.0（Flux/Wan 必要依赖）
+
+# ═══ 3. Python 版本 ═══
+python3 --version
+# 要求：Python ≥ 3.8
+
+# ═══ 4. ComfyUI 版本 ═══
+curl -s http://127.0.0.1:8188/system_stats | python3 -c "import sys,json; d=json.load(sys.stdin); print('ComfyUI:', d.get('comfyui_version','unknown'), '| Device:', d['devices'][0]['name'], '| VRAM free:', round(d['devices'][0]['vram_free']/1e9,1), 'GB')"
+# 记录版本，Flux/Wan 节点可能要求最低版本
+
+# ═══ 5. 自定义节点目录存在性 ═══
+echo "=== 自定义节点检查 ==="
+ls -la /root/ai/ComfyUI/custom_nodes/ 2>/dev/null | head -20
+
+# 检查必备自定义节点
+REQUIRED_NODES=(
+    "ComfyUI-WanVideoWrapper"
+    "ComfyUI-Manager"
+)
+for node in "${REQUIRED_NODES[@]}"; do
+    if [ -d "/root/ai/ComfyUI/custom_nodes/$node" ]; then
+        echo "  [OK] $node"
+    else
+        echo "  [MISSING] $node - 必须安装"
+    fi
+done
+
+# ═══ 6. 自定义节点版本（ComfyUI-WanVideoWrapper） ═══
+if [ -d "/root/ai/ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper" ]; then
+    cd /root/ai/ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper && git log -1 --oneline
+fi
+# Wan Video 任务必须依赖此节点，版本过旧可能导致 workflow 失败
+
+# ═══ 7. 模型目录结构预检查 ═══
+echo "=== 模型目录检查 ==="
+COMFY_DIR=$(ls -d /root/ai/ComfyUI /root/ComfyUI 2>/dev/null | head -1)
+if [ -z "$COMFY_DIR" ]; then
+    echo "[ERROR] ComfyUI 目录不存在"
+else
+    for subdir in checkpoints vae clip text_encoders diffusion_models; do
+        if [ -d "$COMFY_DIR/models/$subdir" ]; then
+            echo "  [OK] models/$subdir"
+        else
+            echo "  [MISSING] models/$subdir - 将自动创建"
+            mkdir -p "$COMFY_DIR/models/$subdir"
+        fi
+    done
+fi
+
+# ═══ 8. 磁盘空间检查 ═══
+echo "=== 磁盘空间 ==="
+df -h /root/ai/ | tail -1
+# 要求：模型下载需要 30GB+ 可用空间，不足则停止
+
+# ═══ 9. aria2c 工具 ═══
+which aria2c || (apt update && apt install -y aria2)
+aria2c --version | head -1
+
+# ═══ 10. 网络连通性（HuggingFace） ═══
+curl -sI https://huggingface.co/ | head -1
+# 必须能访问 HuggingFace 才能下载模型
+```
+
+### 环境检查结果判定
+
+| 检查项 | 最低要求 | 失败处理 |
+|--------|----------|----------|
+| GPU 显存 | ≥ 12GB | 停止，显存不足无法运行 |
+| CUDA 版本 | ≥ 11.8 | 停止，升级驱动/CUDA |
+| Python 版本 | ≥ 3.8 | 停止 |
+| ComfyUI | 可响应 | 启动或重启 ComfyUI |
+| ComfyUI-WanVideoWrapper | 必须存在 | 安装 custom node 才能跑 Wan |
+| 磁盘空间 | ≥ 30GB free | 停止，清理空间 |
+| HuggingFace 连通性 | 必须可达 | 检查网络/DNS |
+
+**检查通过后再进入阶段零。**
+
 ## 进门汇报格式（强制执行）
 
 ```
 当前状态：
 - GPU：<nvidia-smi 型号 + 显存>
-- ComfyUI：<running / not running>
+- CUDA：<torch.cuda.get_device_name()>
+- Python：<python3 --version>
+- ComfyUI：<running / not running, 版本>
+- ComfyUI-WanVideoWrapper：<存在 / 缺失>
 - workflow JSON：<存在路径 / 缺失>
 - Flux 模型：<存在 / 缺失>
 - Wan 模型：<存在 / 缺失>
-- 自定义节点：<wan wrapper 存在 / 缺失>
+- 磁盘空间：<df -h 剩余 GB>
+- 环境检查：<通过 / 未通过>
 - 当前卡点：<无 / 具体>
 - 下一步动作：<具体>
 ```
@@ -182,9 +276,9 @@ if os.path.exists(wan_wf):
 #   - 不允许绕过直接进入正式生产
 ```
 
-## 阶段一：下载模型（基于 workflow 需求）
+## 阶段二：下载模型（基于 workflow 需求）
 
-> 下载前必须先完成阶段零的 workflow 验证。验证通过后才能下载模型。
+> 下载前必须先完成阶段负一（环境检查）和阶段零（workflow 验证）。两项都通过后才能下载模型。
 
 下载前先读 workflow JSON 确定需要的模型：
 
@@ -290,6 +384,8 @@ ls /root/ai/ComfyUI/models/text_encoders/ || ls /root/ai/ComfyUI/models/clip/ ||
 
 ## 阶段三：启动 ComfyUI（如未运行）
 
+> 进门时已通过 `curl 127.0.0.1:8188/system_stats` 确认 ComfyUI 状态。未运行时才执行本阶段。
+
 ```bash
 COMFY_DIR=$(ls -d /root/ai/ComfyUI /root/ComfyUI 2>/dev/null | head -1)
 echo "ComfyUI 目录: $COMFY_DIR"
@@ -325,78 +421,166 @@ echo "workflow JSON 不存在，尝试从 PNG metadata 提取或使用 API"
 
 ### 4.3 提交任务（直接通过 API）
 
+> **适用：4090 24GB VRAM，flux1-dev-fp8.safetensors**
+> FP8 checkpoint 已整合 CLIP-L + T5XXL，直接用 CheckpointLoaderSimple 加载即可。
+
 ```python
 import urllib.request, json, time
 
 API = "http://127.0.0.1:8188"
 
-# 简单 Flux workflow（基于 FP8 checkpoint 方案）
-# CheckpointLoaderSimple -> CLIPTextEncode -> KSampler -> VAEDecode -> SaveImage
-# （FP8 checkpoint 版用标准 SD 节点，无需 Flux 专用节点）
+# ============================================================
+# 正确的 Flux FP8 工作流节点链（4090 / 24GB 适用）
+# CheckpointLoaderSimple → BasicGuider → FluxGuidance
+#                              ↑                        ↓
+# CLIPTextEncode (positive) ← ClipLoader ← t5xxl (已整合)
+#                              ↓
+# EmptyLatentImage → KSampler → VAEDecode → SaveImage
+# ============================================================
 
+# 第 1 步：检查可用节点（确认 Flux 节点已注册）
+with urllib.request.urlopen(f"{API}/object_info") as r:
+    nodes = json.loads(r.read()).keys()
+
+# 参考官方 workflow 节点：CheckpointLoaderSimple, CLIPTextEncode(x2),
+#   EmptySD3LatentImage, FluxGuidance, KSampler, VAEDecode, SaveImage
+required = ["CheckpointLoaderSimple", "CLIPTextEncode", "EmptySD3LatentImage",
+            "FluxGuidance", "KSampler", "VAEDecode", "SaveImage"]
+missing = [n for n in required if n not in nodes]
+if missing:
+    print(f"[ERROR] 缺少节点: {missing}")
+else:
+    print("[OK] 所有必需节点已注册")
+
+# 第 2 步：构建 Flux FP8 workflow（与官方 flux_dev_checkpoint.json 一致）
+# 节点连接（官方 workflow 实际结构）：
+#   CheckpointLoaderSimple → clip (index 1) → CLIPTextEncode(positive) → CONDITIONING
+#   CheckpointLoaderSimple → clip (index 1) → CLIPTextEncode(negative) → CONDITIONING
+#   CheckpointLoaderSimple → model (index 0) → KSampler
+#   CheckpointLoaderSimple → vae (index 2) → VAEDecode
+#   EmptySD3LatentImage → LATENT → KSampler
+#   FluxGuidance(conditioning) → KSampler positive
+#
+# 说明：
+#   - clip 来自 checkpoint 的 index 1（FP8 checkpoint 已整合 clip_l）
+#   - t5xxl 来自 checkpoint 的 index 2（已整合，无需单独加载）
+#   - guidance=3.5 是 Flux 推荐的默认值（范围 1.0~10.0，越高越遵循 prompt）
+#   - 注意：Flux 没有 negative prompt 效果，cfg 强制设为 1.0
 prompt = {
-    "3": {
+    "30": {
         "class_type": "CheckpointLoaderSimple",
         "inputs": {"ckpt_name": "flux1-dev-fp8.safetensors"}
-    },
-    "4": {
-        "class_type": "CLIPTextEncode",
-        "inputs": {
-            "text": "a cute 10-year-old chinese girl in yellow raincoat and red boots, studio ghibli style, watercolor illustration, masterpiece",
-            "clip": ["3", 1]
-        }
-    },
-    "5": {
-        "class_type": "KSampler",
-        "inputs": {
-            "model": ["3", 0],
-            "seed": 12345,
-            "steps": 20,
-            "cfg": 1.0,
-            "sampler_name": "euler",
-            "scheduler": "normal",
-            "positive": ["4", 0],
-            "negative": [],
-            "latent_image": [{"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512, "batch_size": 1}}],
-            "denoise": 1.0
-        }
-    }
-}
-
-# 正确格式：latent_image 应该是 node reference，不是嵌套 dict
-prompt = {
-    "3": {
-        "class_type": "CheckpointLoaderSimple",
-        "inputs": {"ckpt_name": "flux1-dev-fp8.safetensors"}
-    },
-    "4": {
-        "class_type": "CLIPTextEncode",
-        "inputs": {"text": "a cute 10-year-old chinese girl in yellow raincoat and red boots, studio ghibli style, watercolor illustration", "clip": ["3", 1]}
-    },
-    "5": {
-        "class_type": "EmptyLatentImage",
-        "inputs": {"width": 512, "height": 512, "batch_size": 1}
     },
     "6": {
-        "class_type": "KSampler",
-        "inputs": {"model": ["3", 0], "seed": 12345, "steps": 20, "cfg": 1.0, "sampler_name": "euler", "scheduler": "normal", "positive": ["4", 0], "negative": [], "latent_image": ["5", 0], "denoise": 1.0}
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+            "text": "a cute 10-year-old chinese girl in yellow raincoat and red boots, studio ghibli style, watercolor illustration, masterpiece, best quality",
+            "clip": ["30", 1]  # index 1 = clip_l from FP8 checkpoint
+        }
     },
-    "7": {
-        "class_type": "VAEDecode",
-        "inputs": {"samples": ["6", 0], "vae": ["3", 2]}
+    "33": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+            "text": "blurry, low quality, worst quality, deformed, ugly",  # Flux dev ignored, cfg must be 1.0
+            "clip": ["30", 1]
+        }
+    },
+    "27": {
+        "class_type": "EmptySD3LatentImage",
+        "inputs": {"width": 512, "height": 512, "batch_size": 1}
+    },
+    "35": {
+        "class_type": "FluxGuidance",
+        "inputs": {"guidance": 3.5}  # Flux 核心 guidance 值
+    },
+    "31": {
+        "class_type": "KSampler",
+        "inputs": {
+            "model": ["30", 0],           # index 0 = diffusion model
+            "seed": 12345,
+            "steps": 25,                  # Flux 推荐 20~50 步
+            "cfg": 1.0,                   # ★ Flux 必须 cfg=1.0，negative prompt 被忽略
+            "sampler_name": "euler",
+            "scheduler": "simple",
+            "positive": ["35", 0],        # FluxGuidance output → positive
+            "negative": ["6", 0],         # CLIPTextEncode negative → negative
+            "latent_image": ["27", 0]     # EmptySD3LatentImage → latent
+        }
     },
     "8": {
+        "class_type": "VAEDecode",
+        "inputs": {"samples": ["31", 0], "vae": ["30", 2]}  # index 2 = vae from FP8 checkpoint
+    },
+    "9": {
         "class_type": "SaveImage",
-        "inputs": {"images": ["7", 0], "filename_prefix": "flux_test"}
+        "inputs": {"images": ["8", 0], "filename_prefix": "flux_fp8_test"}
     }
 }
 
-data = json.dumps({"prompt": prompt, "last_node_id": "8"}).encode()
+# 第 3 步：提交（使用官方同款节点 ID，与 flux_dev_checkpoint.json 保持一致）
+data = json.dumps({"prompt": prompt, "last_node_id": "9"}).encode()
 req = urllib.request.Request(f"{API}/prompt", data=data, headers={"Content-Type": "application/json"})
 resp = json.loads(req.read().decode())
 prompt_id = resp["prompt_id"]
-print(f"提交: {prompt_id}")
+print(f"提交成功: {prompt_id}")
 ```
+
+**节点引脚对应关系（Flux FP8 checkpoint，来自官方 workflow）：**
+
+| 节点 ID | 类型 | 说明 |
+|---------|------|------|
+| 30 | CheckpointLoaderSimple | index 0=model, index 1=clip, index 2=vae |
+| 6 | CLIPTextEncode | positive prompt conditioning |
+| 33 | CLIPTextEncode | negative prompt conditioning（Flux 不生效，cfg=1.0） |
+| 27 | EmptySD3LatentImage | 生成 latent 空图 |
+| 35 | FluxGuidance | guidance=3.5 → KSampler positive |
+| 31 | KSampler | 核心采样器，cfg 强制 1.0 |
+| 8 | VAEDecode | latent → image |
+| 9 | SaveImage | 输出 PNG |
+
+> **★ 关键：Flux 必须 cfg=1.0** — 官方 Note 说得很清楚：Flux dev/schnell 没有 negative prompt 效果，cfg 设任何值都没用，必须为 1.0。guidance 控制由 FluxGuidance 节点负责（dev 版），schnell 版则不需要 FluxGuidance 节点。
+
+**Schnell 工作流（无 FluxGuidance，节点更少）**
+
+Flux Schnell 是蒸馏版，速度更快，不需要 FluxGuidance 节点：
+
+```python
+prompt = {
+    "30": {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {"ckpt_name": "flux1-schnell-fp8.safetensors"}
+    },
+    "6": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {"text": "a cute 10-year-old chinese girl in yellow raincoat, studio ghibli style", "clip": ["30", 1]}
+    },
+    "27": {
+        "class_type": "EmptySD3LatentImage",
+        "inputs": {"width": 512, "height": 512, "batch_size": 1}
+    },
+    "31": {
+        "class_type": "KSampler",
+        "inputs": {
+            "model": ["30", 0], "seed": 12345, "steps": 4,  # Schnell 只需 4 步
+            "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple",
+            "positive": ["6", 0], "negative": [], "latent_image": ["27", 0]
+        }
+    },
+    "8": {
+        "class_type": "VAEDecode",
+        "inputs": {"samples": ["31", 0], "vae": ["30", 2]}
+    },
+    "9": {
+        "class_type": "SaveImage",
+        "inputs": {"images": ["8", 0], "filename_prefix": "flux_schnell_test"}
+    }
+}
+```
+
+> **Dev vs Schnell 对比**：Dev 需要 FluxGuidance + 25 步；Schnell 无需 guidance + 只需 4 步。两者 cfg 都必须为 1.0。
+
+>
+> **显存优化**：如果 24GB 不够，将 width/height 从 512 降到 256，或 batch_size 降到 1。
 
 ### 4.4 监控（强制）
 
