@@ -10,6 +10,9 @@ description: |
 
   触发：用户说"进GPU"、"连服务器"、"flux生成"、"wan视频"、"run workflow"、"下载模型"
   禁止触发：本地文件操作、飞书文档、PDF等无关任务。
+  skill_id 名称约定：profile里实际目录名是 `comfy-flux-wan-skill`（带-s后缀，不可改），
+  调用时必须用 `skill_view(skill_name='comfy-flux-wan-skill')`，
+  不要用 `comfy-flux-wan`（会导致 Skill not found，6/3 14:44 已踩过此坑）。
 ---
 
 # ComfyUI + Flux/Wan 执行技能
