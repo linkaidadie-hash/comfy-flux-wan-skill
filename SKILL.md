@@ -14,6 +14,50 @@ description: |
 
 # ComfyUI + Flux/Wan 执行技能
 
+> **本文件 GitHub 源（通用版）**：`https://github.com/linkaidadie-hash/comfy-flux-wan-skill`
+> **路径假设**：`/root/ai/ComfyUI/`
+> **本机环境**：autodl 容器，**路径不一致，详见下方"autodl 环境适配"小节**。适配规则是只读 patch，不修改 GitHub 源，方便 `git pull` 同步。
+
+## autodl 环境适配（重要，worker 必读）
+
+> 本节是 **xiaoyimin-pipeline / openclaw-xiaodai** 容器的环境适配，**与 GitHub 通用版路径不同**。worker 在执行任何命令前必须**先运行"路径探测"**，**不要直接照搬 GitHub 源里的 `/root/ai/...` 路径**。
+
+### 路径映射表
+
+| GitHub 源路径 | 本机实际路径 | 说明 |
+|---|---|---|
+| `/root/ai/ComfyUI/` | `/root/autodl-tmp/ComfyUIWanvid/` | ComfyUI 主目录 |
+| `/root/ai/workflows/` | `/root/autodl-tmp/ComfyUIWanvid/workflows/` | workflow JSON |
+| `/root/ai/ComfyUI/models/{checkpoints,vae,...}` | `/root/autodl-tmp/ComfyUIWanvid/models/{checkpoints,vae,...}` | 模型目录 |
+| `/root/ai/ComfyUI/output` | `/root/autodl-tmp/ComfyUIWanvid/output` | 产物输出 |
+| `/root/ai/ComfyUI/custom_nodes/` | `/root/autodl-tmp/ComfyUIWanvid/custom_nodes/` | 自定义节点 |
+| `/root/ai/comfyui.log` | `/root/autodl-tmp/ComfyUIWanvid/comfyui.log` | 日志 |
+| 磁盘空间查询 `df -h /root/ai/` | 改为 `df -h /root/autodl-tmp/` | 数据盘100G，**不要写到 `/root` overlay盘** |
+| 视频工单产物目录 | `/root/autodl-tmp/wuhai_story/output/` | 业务产物 |
+
+### 路径探测脚本（worker 进门必跑）
+
+```bash
+# 真实路径探测（以本机为准）
+COMFY_DIR=$(ls -d /root/autodl-tmp/ComfyUIWanvid /root/ai/ComfyUI 2>/dev/null | head -1)
+if [ -z "$COMFY_DIR" ]; then
+    echo "[FATAL] ComfyUI 目录不存在，本机预期 /root/autodl-tmp/ComfyUIWanvid/"
+    echo "        拉仓库并参考 README.md 初始化"
+    exit 1
+fi
+WF_DIR="$COMFY_DIR/workflows"
+LOG="$COMFY_DIR/comfyui.log"
+echo "COMFY_DIR=$COMFY_DIR"
+echo "WF_DIR=$WF_DIR"
+echo "LOG=$LOG"
+```
+
+### 业务集成点
+
+- **xiaoyimin 工单派发**：主控 `xiaoyimin-pipeline/` 目录下所有 runner 引用本 skill 时，必须用本节路径映射替换 `/root/ai/...`。
+- **pilot 闸门**：`/root/.hermes/workflows/xiaoyimin-pipeline/pilot_gate.sh`，字段名 `pilot_required`（不是 `pilot_run_required`，已于 2026-06-04 修复）。
+- **GPU 标记**：`/root/.hermes/state/gpu_open.flag` 不存在 = GPU 未开，所有 video 工单 `wan_video_generator.py --pilot` 直接 reject。
+
 ## 核心理念
 
 **workflow = 磁盘上真实 `.json` 文件。**
